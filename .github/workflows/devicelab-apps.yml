@@ -1,0 +1,158 @@
+name: DeviceLab apps
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - devicelab-build-5c5de92
+    paths:
+      - .github/workflows/devicelab-apps.yml
+
+concurrency:
+  group: devicelab-apps-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DISABLE_RNREPO: '1'
+
+jobs:
+  rn-android:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64-v8a, x86_64]
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL || true
+          df -h /
+      - name: Setup
+        uses: ./.github/actions/setup
+      - name: Build library and generate codegen
+        run: yarn prepare
+      - name: Setup Android
+        uses: ./.github/actions/setup-android
+        with:
+          gradle-wrapper-properties: apps/react-native-example/android/gradle/wrapper/gradle-wrapper.properties
+      - name: Set disableLogBox
+        run: |
+          node -e 'const f=process.argv[1],fs=require("fs");const c=JSON.parse(fs.readFileSync(f,"utf8"));c.disableLogBox=true;fs.writeFileSync(f,JSON.stringify(c,null,2)+"\n");' apps/react-native-example/e2e-config.json
+          cat apps/react-native-example/e2e-config.json
+      - name: Build release APK
+        working-directory: apps/react-native-example/android
+        env:
+          JAVA_OPTS: '-XX:MaxHeapSize=6g'
+        run: ./gradlew assembleRelease --no-daemon --console=plain -PreactNativeArchitectures=${{ matrix.arch }}
+      - name: Inspect
+        run: |
+          find apps/react-native-example/android/app/build/outputs -name '*.apk' -exec ls -la {} \;
+          unzip -l apps/react-native-example/android/app/build/outputs/apk/release/app-release.apk | grep -E 'index.android.bundle|lib/' | head -20
+      - uses: actions/upload-artifact@v4
+        with:
+          name: em-rn-android-${{ matrix.arch }}
+          path: apps/react-native-example/android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+
+  native-android:
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup
+        uses: ./.github/actions/setup
+      - name: Setup Android
+        uses: ./.github/actions/setup-android
+        with:
+          gradle-wrapper-properties: apps/android-example/gradle/wrapper/gradle-wrapper.properties
+      - name: Build debug APK
+        working-directory: apps/android-example
+        env:
+          JAVA_OPTS: '-XX:MaxHeapSize=6g'
+        run: ./gradlew assembleDebug --no-daemon --console=plain
+      - name: Inspect
+        run: |
+          find apps/android-example/app/build/outputs -name '*.apk' -exec ls -la {} \;
+          unzip -l apps/android-example/app/build/outputs/apk/debug/app-debug.apk | grep 'lib/' | head -20
+      - uses: actions/upload-artifact@v4
+        with:
+          name: em-native-android
+          path: apps/android-example/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+  rn-ios:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup
+        uses: ./.github/actions/setup
+      - name: Build library
+        run: yarn prepare
+      - name: Set up Xcode
+        uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
+        with:
+          xcode-version: '26.3'
+      - name: Set disableLogBox
+        run: |
+          node -e 'const f=process.argv[1],fs=require("fs");const c=JSON.parse(fs.readFileSync(f,"utf8"));c.disableLogBox=true;fs.writeFileSync(f,JSON.stringify(c,null,2)+"\n");' apps/react-native-example/e2e-config.json
+          cat apps/react-native-example/e2e-config.json
+      - name: Install cocoapods
+        run: |
+          cd apps/react-native-example/ios
+          rm -rf Pods
+          pod install
+        env:
+          NO_FLIPPER: 1
+      - name: Build Release for simulator
+        working-directory: apps/react-native-example/ios
+        run: |
+          set -o pipefail
+          xcodebuild -workspace EnrichedMarkdownExample.xcworkspace -scheme EnrichedMarkdownExample \
+            -configuration Release -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath build CODE_SIGNING_ALLOWED=NO build | tail -n 200
+      - name: Zip app
+        run: |
+          APP=$(find apps/react-native-example/ios/build/Build/Products/Release-iphonesimulator -maxdepth 1 -name '*.app' | head -1)
+          echo "$APP"; ls "$APP" | head -50
+          test -f "$APP/main.jsbundle"
+          mkdir -p out && ditto -c -k --keepParent "$APP" out/EnrichedMarkdownExample-rn-sim.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: em-rn-ios-sim
+          path: out/*.zip
+          if-no-files-found: error
+
+  native-ios:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup
+        uses: ./.github/actions/setup
+      - name: Restore RaTeX vendor files
+        run: node vendor/vendor-ratex.mjs
+      - name: Set up Xcode
+        uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
+        with:
+          xcode-version: '26.3'
+      - name: Build Debug for simulator
+        working-directory: apps/ios-example
+        run: |
+          set -o pipefail
+          xcodebuild -project EnrichedMarkdownExample/EnrichedMarkdownExample.xcodeproj -scheme EnrichedMarkdownExample \
+            -configuration Debug -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath build CODE_SIGNING_ALLOWED=NO build | tail -n 200
+      - name: Zip app
+        run: |
+          APP=$(find apps/ios-example/build/Build/Products/Debug-iphonesimulator -maxdepth 1 -name '*.app' | head -1)
+          echo "$APP"; ls "$APP"
+          mkdir -p out && ditto -c -k --keepParent "$APP" out/EnrichedMarkdownExample-native-sim.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: em-native-ios-sim
+          path: out/*.zip
+          if-no-files-found: error
